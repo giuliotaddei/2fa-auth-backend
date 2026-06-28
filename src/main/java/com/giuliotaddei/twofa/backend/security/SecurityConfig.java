@@ -1,6 +1,6 @@
 package com.giuliotaddei.twofa.backend.security;
 
-import com.giuliotaddei.twofa.backend.repository.UserRepository;
+import com.giuliotaddei.twofa.backend.config.RateLimitFilter;
 import com.giuliotaddei.twofa.backend.security.jwt.JwtAuthFilter;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
@@ -14,8 +14,6 @@ import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.config.annotation.web.configurers.AbstractHttpConfigurer;
 import org.springframework.security.config.http.SessionCreationPolicy;
-import org.springframework.security.core.userdetails.UserDetailsService;
-import org.springframework.security.core.userdetails.UsernameNotFoundException;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.web.SecurityFilterChain;
@@ -32,25 +30,23 @@ import java.util.List;
 public class SecurityConfig {
 
     private final JwtAuthFilter jwtAuthFilter;
-    private final UserRepository userRepository;
+    private final RateLimitFilter rateLimitFilter;
+    private final CustomUserDetailsService customUserDetailsService;
 
     @Value("${cors.allowed-origins}")
     private String allowedOrigins;
 
-    /**
-     * Endpoint pubblici: registrazione, login step1, verify totp.
-     * Tutto il resto richiede autenticazione (JWT valido).
-     */
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
         return http
-                .csrf(AbstractHttpConfigurer::disable)          // disabilitato perché usiamo JWT (stateless)
+                .csrf(AbstractHttpConfigurer::disable)
                 .cors(cors -> cors.configurationSource(corsConfigurationSource()))
                 .sessionManagement(session ->
                         session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(auth -> auth
                         .requestMatchers(
                                 "/api/auth/register",
+                                "/api/auth/register/confirm-totp",
                                 "/api/auth/login",
                                 "/api/auth/verify-totp",
                                 "/api/auth/refresh"
@@ -58,6 +54,7 @@ public class SecurityConfig {
                         .anyRequest().authenticated()
                 )
                 .authenticationProvider(authenticationProvider())
+                .addFilterBefore(rateLimitFilter, UsernamePasswordAuthenticationFilter.class)
                 .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class)
                 .build();
     }
@@ -77,19 +74,8 @@ public class SecurityConfig {
     }
 
     @Bean
-    public UserDetailsService userDetailsService() {
-        return email -> userRepository.findByEmail(email)
-                .map(user -> org.springframework.security.core.userdetails.User.builder()
-                        .username(user.getEmail())
-                        .password(user.getPasswordHash())
-                        .roles("USER")
-                        .build())
-                .orElseThrow(() -> new UsernameNotFoundException("Utente non trovato: " + email));
-    }
-
-    @Bean
     public AuthenticationProvider authenticationProvider() {
-        DaoAuthenticationProvider provider = new DaoAuthenticationProvider(userDetailsService());
+        DaoAuthenticationProvider provider = new DaoAuthenticationProvider(customUserDetailsService);
         provider.setPasswordEncoder(passwordEncoder());
         return provider;
     }

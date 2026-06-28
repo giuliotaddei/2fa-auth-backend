@@ -97,6 +97,7 @@ public class AuthService {
      * Se corrette, emette un temp token (valido 5 min) da usare per il verify-totp.
      * Non emette ancora l'access token definitivo.
      */
+    @Transactional
     public String loginStepOne(LoginRequest request) {
         User user = findUserByEmail(request.email());
 
