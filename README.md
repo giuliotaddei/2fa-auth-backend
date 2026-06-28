@@ -12,6 +12,7 @@ Sistema di autenticazione a due fattori (2FA) riutilizzabile, costruito con **Sp
 - [Stack tecnologico](#-stack-tecnologico)
 - [Architettura](#-architettura)
 - [Flusso di autenticazione](#-flusso-di-autenticazione)
+- [Cifratura, hashing e gestione dei segreti](#-cifratura-hashing-e-gestione-dei-segreti)
 - [Setup del progetto](#-setup-del-progetto)
 - [Configurazione variabili d'ambiente](#-configurazione-variabili-dambiente)
 - [Documentazione API](#-documentazione-api)
@@ -107,6 +108,54 @@ POST /api/auth/logout     → invalida tutti i refresh token dell'utente
 
 Separare *tempToken* e *accessToken* impedisce che un client possa accedere alle risorse protette avendo verificato solo email+password, senza completare il secondo fattore. Il `tempToken` ha un claim `type: temp` che lo rende valido **solo** per l'endpoint `/verify-totp`.
 
+---
+## 🔐 Cifratura, hashing e gestione dei segreti
+ 
+Il sistema usa tre primitive crittografiche distinte, ognuna scelta per un motivo specifico legato al tipo di dato da proteggere e a *chi* deve poterlo recuperare (se qualcuno).
+ 
+### Password utente → bcrypt (hashing, one-way)
+ 
+Le password non vengono mai cifrate: vengono **hashate** con bcrypt (`BCryptPasswordEncoder`). La differenza è sostanziale: la cifratura è reversibile con la chiave giusta, l'hashing no — non esiste un'operazione di "decifratura" per un hash bcrypt. In fase di login, il backend non "decifra" nulla: prende la password in chiaro inviata dal client (dentro il payload HTTPS) e chiama `passwordEncoder.matches(rawPassword, storedHash)`, che ricalcola l'hash con lo stesso salt e confronta i risultati.
+ 
+bcrypt è scelto rispetto a un semplice SHA-256 perché incorpora un **salt automatico** (rende inutile l'uso di tabelle rainbow precompilate) ed è **deliberatamente lento** (cost factor configurabile), il che rende gli attacchi brute-force computazionalmente costosi anche con hardware dedicato.
+ 
+### Secret TOTP → AES-256-GCM (cifratura, two-way)
+ 
+Il secret TOTP è diverso: il backend **deve** poterlo rileggere in chiaro ogni volta che un utente fa login, per calcolare il codice OTP atteso e confrontarlo con quello inserito. Per questo non può essere hashato — serve cifratura reversibile.
+ 
+La scelta è **AES-256 in modalità GCM** (Galois/Counter Mode) invece della più comune modalità CBC. GCM è una cifratura *autenticata*: oltre a rendere il testo illeggibile, genera un tag di autenticazione che permette di rilevare se il ciphertext è stato alterato. Con CBC, un attaccante con accesso al database potrebbe modificare bit del testo cifrato senza che il sistema se ne accorga fino a decifratura fallita o, peggio, fino a un risultato decifrato ma corrotto e non rilevato. Con GCM, qualsiasi manomissione fa fallire la decifratura in modo esplicito (`AEADBadTagException`).
+ 
+Il flusso implementato in `EncryptionService`:
+ 
+```
+encrypt(secret):
+  1. genera un IV (Initialization Vector) casuale a 96 bit con SecureRandom
+  2. cifra il secret con AES-256-GCM usando la encryption.key + l'IV
+  3. concatena IV e ciphertext (entrambi Base64) separati da ":"
+  4. salva la stringa risultante nel campo totp_secret della tabella users
+ 
+decrypt(storedValue):
+  1. separa IV e ciphertext dalla stringa salvata
+  2. ricostruisce il Cipher con la stessa chiave e lo stesso IV
+  3. restituisce il secret in chiaro, usato solo in memoria per il calcolo TOTP
+```
+ 
+L'IV è generato in modo nuovo a ogni cifratura (non è mai riutilizzato con la stessa chiave, requisito fondamentale di GCM per non comprometterne le garanzie di sicurezza) e viene salvato insieme al ciphertext perché serve, comunque in chiaro, anche in fase di decifratura — non è un segreto, è un parametro.
+ 
+### Calcolo del codice TOTP
+ 
+Una volta decifrato il secret, `TotpService` non fa altro che applicare l'algoritmo standard **RFC 6238** (TOTP, estensione di RFC 4226/HOTP): l'orario corrente diviso in finestre da 30 secondi viene combinato con il secret tramite HMAC-SHA1, e dal risultato si estraggono 6 cifre. Lo stesso identico calcolo è fatto in parallelo dall'app authenticator sul telefono, partendo dallo stesso secret (ottenuto dalla scansione del QR code). Per questo nessun dato deve transitare tra telefono e server al momento della generazione del codice: i due lati calcolano indipendentemente lo stesso valore, sincronizzati solo dall'orologio di sistema. Il backend accetta una finestra di tolleranza di ±1 step (quindi codici del minuto precedente o successivo) per assorbire piccoli disallineamenti di clock tra client e server.
+ 
+### Refresh token → hash SHA-256 (non cifratura, non bcrypt)
+ 
+Il refresh token che il client riceve ed usa per ottenere nuovi access token **non viene salvato nel database**. Viene salvato solo il suo hash SHA-256 (`RefreshTokenService.hashToken`). La logica è simile a quella delle password: il server non ha mai bisogno di recuperare il token originale, solo di verificare che un token ricevuto corrisponda a uno emesso in precedenza — un confronto di hash è sufficiente e più semplice di bcrypt, perché qui il token è già ad alta entropia (32 byte casuali generati da `SecureRandom`), quindi non serve un algoritmo lento o salato per difendersi da dizionari o brute-force: l'unico vettore d'attacco rilevante è il furto diretto del valore, contro cui l'hash protegge comunque in caso di esfiltrazione del database.
+ 
+Ad ogni utilizzo il refresh token viene invalidato e ne viene emesso uno nuovo (*rotation*): se un token venisse intercettato e riutilizzato dopo che il legittimo proprietario l'ha già consumato, risulterebbe non più presente nel database e la richiesta verrebbe respinta.
+ 
+### JWT → firma HMAC, non cifratura
+ 
+Un punto spesso confuso: i JWT (`tempToken` e `accessToken`) **non sono cifrati**, sono **firmati**. Chiunque può decodificare un JWT e leggerne il contenuto (provare su jwt.io) — i claim (`sub`, `type`, `exp`) sono in chiaro, solo codificati in Base64URL, non protetti da lettura. Quello che `JwtService` garantisce con `signWith(signingKey)` è l'**integrità**: se qualcuno alterasse anche un singolo carattere del payload, la firma HMAC-SHA non corrisponderebbe più in fase di validazione (`Jwts.parser().verifyWith(signingKey)`), e il token verrebbe rifiutato. Per questo nel JWT non viene mai inserito nulla che debba restare confidenziale (niente password, niente secret TOTP) — solo l'email dell'utente e il tipo di token.
+ 
 ---
 
 ## Setup del progetto
