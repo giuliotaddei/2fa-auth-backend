@@ -13,6 +13,7 @@ Sistema di autenticazione a due fattori (2FA) riutilizzabile, costruito con **Sp
 - [Architettura](#-architettura)
 - [Flusso di autenticazione](#-flusso-di-autenticazione)
 - [Cifratura, hashing e gestione dei segreti](#-cifratura-hashing-e-gestione-dei-segreti)
+- [Rate limiting e protezione brute-force](#-rate-limiting-e-protezione-brute-force)
 - [Setup del progetto](#-setup-del-progetto)
 - [Configurazione variabili d'ambiente](#-configurazione-variabili-dambiente)
 - [Documentazione API](#-documentazione-api)
@@ -109,7 +110,7 @@ POST /api/auth/logout     → invalida tutti i refresh token dell'utente
 Separare *tempToken* e *accessToken* impedisce che un client possa accedere alle risorse protette avendo verificato solo email+password, senza completare il secondo fattore. Il `tempToken` ha un claim `type: temp` che lo rende valido **solo** per l'endpoint `/verify-totp`.
 
 ---
-## 🔐 Cifratura, hashing e gestione dei segreti
+## Cifratura, hashing e gestione dei segreti
  
 Il sistema usa tre primitive crittografiche distinte, ognuna scelta per un motivo specifico legato al tipo di dato da proteggere e a *chi* deve poterlo recuperare (se qualcuno).
  
@@ -157,6 +158,56 @@ Ad ogni utilizzo il refresh token viene invalidato e ne viene emesso uno nuovo (
 Un punto spesso confuso: i JWT (`tempToken` e `accessToken`) **non sono cifrati**, sono **firmati**. Chiunque può decodificare un JWT e leggerne il contenuto (provare su jwt.io) — i claim (`sub`, `type`, `exp`) sono in chiaro, solo codificati in Base64URL, non protetti da lettura. Quello che `JwtService` garantisce con `signWith(signingKey)` è l'**integrità**: se qualcuno alterasse anche un singolo carattere del payload, la firma HMAC-SHA non corrisponderebbe più in fase di validazione (`Jwts.parser().verifyWith(signingKey)`), e il token verrebbe rifiutato. Per questo nel JWT non viene mai inserito nulla che debba restare confidenziale (niente password, niente secret TOTP) — solo l'email dell'utente e il tipo di token.
  
 ---
+
+## Rate limiting e protezione brute-force
+ 
+### Il problema che il rate limiting risolve
+ 
+Senza alcun limite, un attaccante potrebbe scrivere uno script che chiama `/api/auth/login` migliaia di volte al secondo, provando password diverse (attacco brute-force) o provando a indovinare il codice TOTP a 6 cifre (che ha "solo" un milione di combinazioni possibili — non trascurabile senza protezione). Lo stesso vale per `/register`, dove uno script potrebbe creare migliaia di account fittizi in pochi secondi. Il rate limiting impone un tetto massimo di richieste accettate in una finestra di tempo, da uno stesso IP, rendendo questi attacchi computazionalmente poco praticabili.
+ 
+Questo si affianca, senza sostituirlo, all'**account lockout** descritto nella sezione sicurezza (che agisce per singolo utente dopo N tentativi falliti): il rate limiting agisce per IP e a monte di qualsiasi logica di business, fermando il traffico eccessivo prima ancora che arrivi al controller.
+ 
+### Cos'è Bucket4j
+ 
+**Bucket4j** è una libreria Java che implementa l'algoritmo del **token bucket**, uno dei modelli più diffusi per il rate limiting (lo stesso usato internamente da servizi come le API di AWS o Stripe). L'idea è concettualmente semplice:
+ 
+
+### Come è configurato in questo progetto
+ 
+```properties
+rate-limit.login.capacity=5
+rate-limit.login.refill-minutes=1
+```
+ 
+Questo significa: **5 richieste ogni 1 minuto, per IP**, sugli endpoint protetti. Tradotto in pratica, un singolo IP può tentare il login (o la registrazione, o la verifica TOTP) al massimo 5 volte in 60 secondi; la sesta richiesta nello stesso minuto viene rifiutata con HTTP `429 Too Many Requests`, indipendentemente dal fatto che le credenziali fornite siano corrette o no — il controllo avviene *prima* che la richiesta raggiunga `AuthController`.
+ 
+Nel codice, `RateLimitConfig` mantiene una mappa di bucket — uno per ogni IP che ha fatto almeno una richiesta — usando `refillGreedy`, una strategia di refill che ridistribuisce i gettoni in modo continuo nella finestra temporale (a differenza di un refill "a blocco" che ricaricherebbe tutti i 5 gettoni di colpo allo scadere del minuto):
+ 
+```java
+Bandwidth limit = Bandwidth.builder()
+        .capacity(capacity)
+        .refillGreedy(capacity, Duration.ofMinutes(refillMinutes))
+        .build();
+```
+ 
+`RateLimitFilter`, eseguito come filtro Spring Security prima di `JwtAuthFilter`, intercetta ogni richiesta verso gli endpoint sensibili (`/login`, `/register`, `/verify-totp`), risolve l'IP del chiamante, recupera il bucket corrispondente e tenta di consumare un gettone:
+ 
+```java
+ConsumptionProbe probe = bucket.tryConsumeAndReturnRemaining(1);
+ 
+if (probe.isConsumed()) {
+    // richiesta autorizzata, prosegue verso il controller
+} else {
+    // 429 Too Many Requests, con indicazione di quanti secondi attendere
+}
+```
+ 
+### Limite noto di questa implementazione
+ 
+I bucket sono mantenuti **in memoria** (`ConcurrentHashMap`), il che significa che si azzerano a ogni riavvio dell'applicazione e — in caso di deploy su più istanze dietro un load balancer — ogni istanza avrebbe il proprio conteggio indipendente, rendendo il limite effettivo pari a `capacity × numero di istanze`. Per un singolo'istanza, come in questo progetto, non è un problema; in un'architettura distribuita la soluzione tipica è spostare lo stato dei bucket su un backend condiviso come Redis (Bucket4j supporta nativamente questa integrazione tramite il modulo `bucket4j-redis`).
+ 
+---
+
 
 ## Setup del progetto
 
