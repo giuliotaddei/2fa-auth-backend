@@ -384,16 +384,6 @@ src/main/java/com/giuliotaddei/
 
 ---
 
-## Possibili sviluppi futuri
-
-- Frontend Angular dimostrativo che consuma queste API
-- Recupero password via email
-- Supporto a metodi 2FA aggiuntivi (WebAuthn/FIDO2)
-- Test unitari e di integrazione
-- Containerizzazione con Docker Compose (app + MySQL)
-
----
-
 ## Licenza
 
 Progetto personale a scopo di portfolio. Sentiti libero di usarlo come riferimento o punto di partenza per i tuoi progetti.
